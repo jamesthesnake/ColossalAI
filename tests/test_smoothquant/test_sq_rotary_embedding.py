@@ -6,9 +6,7 @@ import torch
 from packaging import version
 
 try:
-    pass
-
-    from colossalai.kernel.triton.rotary_embedding_kernel import rotary_embedding_fwd
+    from colossalai.kernel.triton import int8_rotary_embedding_fwd
 
     HAS_TRITON = True
 except ImportError:
@@ -36,7 +34,7 @@ def test_rotary_emb():
     SEQ_LEN = 1
     HEAD_NUM = 32
     HEAD_DIM = 128
-    dtype = torch.half
+    dtype = torch.float
     # create data
     x_shape = (SEQ_LEN, HEAD_NUM, HEAD_DIM)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device="cuda")
@@ -45,10 +43,16 @@ def test_rotary_emb():
     sin = -2.0 + 0.5 * torch.randn(cos_shape, dtype=dtype, device="cuda")
     # forward pass
     y_torch = torch_rotary_emb(x, cos, sin)
-    rotary_embedding_fwd(x, cos, sin)
-    y_triton = x
-    # compare
-    assert torch.allclose(y_torch, y_triton, atol=1e-2, rtol=0)
+
+    input_scale = torch.max(torch.abs(x)) / 127
+    output_scale = torch.max(torch.abs(y_torch)) / 127
+
+    x = x / input_scale
+    x = x.to(torch.int8)
+
+    int8_rotary_embedding_fwd(x, cos, sin, input_scale.item(), output_scale.item())
+    y_triton = x.to(torch.float) * output_scale
+    assert torch.allclose(y_triton, y_torch, atol=2e-1, rtol=1e-2, equal_nan=True)
 
 
 if __name__ == "__main__":
