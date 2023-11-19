@@ -3,6 +3,7 @@ import os
 import time
 
 import torch
+from _utils import print_perf_stats
 from transformers import LlamaForCausalLM, LlamaTokenizer
 
 import colossalai
@@ -12,25 +13,6 @@ from colossalai.shardformer import ShardConfig
 from colossalai.testing import clear_cache_before_run, rerun_if_address_is_in_use, spawn
 
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
-
-
-def print_perf_stats(latency_set, config, bs, warmup=3):
-    torch.cuda.empty_cache()
-    # trim warmup queries
-    latency_set = list(latency_set)
-    latency_set = latency_set[warmup:]
-    count = len(latency_set)
-
-    if count > 0:
-        latency_set.sort()
-        avg = sum(latency_set) / count
-        num_layers = getattr(config, "num_layers", config.num_hidden_layers)
-        num_parameters = num_layers * config.hidden_size * config.hidden_size * 12
-        num_bytes = 2
-
-        print("Avg Per Token Latency: {0:8.2f} ms".format(avg * 1000))
-        print("Avg BW: {0:8.2f} GB/s".format(1 / avg * num_parameters * num_bytes / 1e9))
-        print("Avg flops: {0:8.2f} TFlops/s".format(1 / avg * num_parameters * num_bytes * bs / 1e12))
 
 
 def run_llama_test(args):
@@ -46,9 +28,10 @@ def run_llama_test(args):
     tokenizer.pad_token_id = tokenizer.unk_token_id
     model = LlamaForCausalLM.from_pretrained(llama_model_path, pad_token_id=tokenizer.eos_token_id)
     model = model.half()
-    model.config
 
-    shard_config = ShardConfig(enable_tensor_parallelism=True if args.tp_size > 1 else False, inference_only=True)
+    shard_config = ShardConfig(
+        enable_tensor_parallelism=True if args.tp_size > 1 else False, extra_kwargs={"inference_only": True}
+    )
     infer_engine = TPInferEngine(model, shard_config, max_batch_size, max_input_len, max_output_len)
 
     generate_kwargs = dict(max_new_tokens=1, do_sample=False)
@@ -104,6 +87,8 @@ def run_llama_test(args):
         print("decoder process latency is : " + str(latency) + " s")
         print("decoder throughput is : " + str(1 / latency * max_batch_size))
 
+    print_perf_stats(times, model.config, max_batch_size)
+
 
 def check_llama(rank, world_size, port, args):
     disable_existing_loggers()
@@ -121,8 +106,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--path", type=str, help="Model path", required=True)
     parser.add_argument("-tp", "--tp_size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument("-b", "--batch_size", type=int, default=16, help="Maximum batch size")
-    parser.add_argument("--input_len", type=int, default=256, help="Maximum input length")
+    parser.add_argument("-b", "--batch_size", type=int, default=32, help="Maximum batch size")
+    parser.add_argument("--input_len", type=int, default=1024, help="Maximum input length")
     parser.add_argument("--output_len", type=int, default=128, help="Maximum output length")
     parser.add_argument(
         "--test_mode", type=str, help="Test mode", default="e2e_test", choices=["e2e_test", "decoder_test"]

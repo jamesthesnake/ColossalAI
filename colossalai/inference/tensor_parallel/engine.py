@@ -13,6 +13,8 @@ from colossalai.shardformer.policies.auto_policy import get_autopolicy
 from .batch_infer_state import BatchInferState
 from .kvcache_manager import MemoryManager
 
+# from dynamic_batching.infer_batch import InferBatch
+
 DP_AXIS, PP_AXIS, TP_AXIS = 0, 1, 2
 
 _supported_models = [
@@ -42,7 +44,7 @@ class TPInferEngine:
         >>> # define model and shard config for your inference
         >>> model = ...
         >>> generate_kwargs = ...
-        >>> shard_config = ShardConfig(enable_tensor_parallelism=True, inference_only=True)
+        >>> shard_config = ShardConfig(enable_tensor_parallelism=True, extra_kwargs={"inference_only": True})
         >>> infer_engine = TPInferEngine(model, shard_config, MAX_BATCH_SIZE, MAX_INPUT_LEN, MAX_OUTPUT_LEN)
         >>> outputs = infer_engine.generate(input_ids, **generate_kwargs)
     """
@@ -61,7 +63,6 @@ class TPInferEngine:
         self.max_input_len = max_input_len
         self.max_output_len = max_output_len
         self.max_total_token_num = self.max_batch_size * (self.max_input_len + self.max_output_len)
-
         # Constraints relatable with specs of devices and model
         # This may change into an optional arg in the future
         assert self.max_batch_size <= 64, "Max batch size exceeds the constraint"
@@ -76,13 +77,16 @@ class TPInferEngine:
         )
         self.layer_num = num_hidden_layers
 
-        self.multi_query_group_num = 0
+        self.multi_query_group_num = model.config.num_attention_heads
+        # default to attention_heads
+        if hasattr(model.config, "multi_query_attention"):
+            self.multi_query_attention = getattr(model.config, "multi_query_attention")
 
         if hasattr(model.config, "multi_query_group_num"):
-            self.multi_query_group_num = model.config.multi_query_group_num
+            self.multi_query_group_num = getattr(model.config, "multi_query_group_num")
 
         if hasattr(model.config, "num_key_value_heads"):
-            self.multi_query_group_num = model.config.num_key_value_heads
+            self.multi_query_group_num = getattr(model.config, "num_key_value_heads")
 
         self.tp_size = -1  # to be set with given shard config in self.prepare_shard_config
         self.cache_manager = None
@@ -96,6 +100,8 @@ class TPInferEngine:
 
         self.shard_config = shard_config
         self.model = None
+        self.cache = {}
+
         # optimize the original model by sharding with ShardFormer
         self._optimize_model(model=model.to(device))
 
@@ -104,7 +110,7 @@ class TPInferEngine:
         assert self.head_num % self.tp_size == 0, f"Cannot shard {self.head_num} heads with tp size {self.tp_size}"
         self.head_num //= self.tp_size  # update sharded number of heads
 
-        if self.multi_query_group_num:
+        if hasattr(self, "multi_query_attention"):
             # NOTE the logic of MQA tensor parallelism should be specified.
             assert (
                 self.multi_query_group_num % self.tp_size == 0
@@ -175,7 +181,7 @@ class TPInferEngine:
         In further generation, use the sharded model instead of original model.
         """
         # NOTE we will change to use an inference config later with additional attrs we want
-        assert self.shard_config.inference_only is True
+        assert self.shard_config.extra_kwargs["inference_only"] is True
         shardformer = ShardFormer(shard_config=self.shard_config)
         self._prepare_with_shard_config(shard_config=self.shard_config)
         self._shard_model_by(shardformer, model)
@@ -197,10 +203,10 @@ class TPInferEngine:
                 enable_all_optimization=False,
                 enable_flash_attention=False,
                 enable_jit_fused=False,
-                inference_only=True,
+                extra_kwargs={"inference_only": True},
             )
         else:
-            shard_config.inference_only = True
+            shard_config.extra_kwargs = {"inference_only": True}
             shard_config.pipeline_stage_manager = None
             if shard_config.enable_tensor_parallelism:
                 self.tp_size = shard_config.tensor_parallel_size
@@ -215,13 +221,11 @@ class TPInferEngine:
         ), "Discrepancy between the tp size of TPInferEngine and the tp size of shard config"
         model_name = model.__class__.__name__
         assert model_name in self.supported_models, f"Unsupported model cls {model_name} for TP inference."
-
-        model = model.model if self.shard_config.inference_gptq else model
-
-        policy = get_autopolicy(model, inference_only=True)
+        if self.shard_config.extra_kwargs.get("inference_gptq", False):
+            model = model.model
+        policy = get_autopolicy(model, shard_config=self.shard_config)
         self.model, _ = shardformer.optimize(model, policy)
-
-        if self.shard_config.inference_gptq:
+        if self.shard_config.extra_kwargs.get("inference_gptq", False):
             self._post_init_gptq_buffer(self.model)
 
         self.model = self.model.cuda()
@@ -284,7 +288,6 @@ class TPInferEngine:
             attention_mask = [attention_mask] if attention_mask is not None else attention_mask
 
         batch_size = len(input_ids_list)
-
         seq_start_indexes = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
         seq_lengths = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
         start_index = 0
@@ -309,6 +312,7 @@ class TPInferEngine:
                 seq_start_indexes[i] = start_index
                 start_index += curr_seq_len
                 max_len_in_batch = curr_seq_len if curr_seq_len > max_len_in_batch else max_len_in_batch
+
         block_loc = torch.empty((batch_size, self.max_input_len + self.max_output_len), dtype=torch.long, device="cuda")
         batch_infer_state = BatchInferState(batch_size, max_len_in_batch)
         batch_infer_state.seq_len = seq_lengths.to("cuda")
@@ -318,6 +322,7 @@ class TPInferEngine:
         batch_infer_state.past_key_values_len = 0
         batch_infer_state.is_context_stage = True
         batch_infer_state.set_cache_manager(self.cache_manager)
+
         return batch_infer_state
 
     @torch.no_grad()
@@ -380,6 +385,85 @@ class TPInferEngine:
         device = infer_state.start_loc.device
         infer_state.start_loc = infer_state.start_loc + torch.arange(0, batch_size, dtype=torch.int32, device=device)
         infer_state.seq_len += 1
+
+    @torch.no_grad()
+    def forward(self, batch_id, is_prefill):
+        """
+        Forward is used in Dynamic Batching Manager
+        """
+        batch = self.cache.pop(batch_id)
+        if is_prefill:
+            input_ = torch.tensor(batch.all_input_ids).cuda()
+        else:
+            input_ = batch.input_ids.reshape(len(batch), 1)
+
+        batch_args = {
+            "batch_size": len(batch),
+            "max_len_in_batch": batch.nopad_max_len_in_batch,
+            "block_loc": batch.nopad_b_loc,
+            "start_loc": batch.nopad_b_start_loc,
+            "seq_len": batch.nopad_b_seq_len,
+            "cache_manager": batch.cache_manager,
+            "is_context_stage": is_prefill,
+        }
+
+        infer_state = BatchInferState(**batch_args)
+        model = self.model
+        if isinstance(model, LlamaForCausalLM):
+            model = self.model.model
+        elif isinstance(model, BloomForCausalLM):
+            model = self.model.transformer
+
+        setattr(model, "infer_state", infer_state)
+        output = self.model.forward(input_ids=input_)
+        logits = output.logits
+        # bsz, seq_len, vocab_size
+        prob_out = torch.softmax(
+            logits[
+                :,
+                -1,
+            ],
+            dim=-1,
+        ).squeeze(1)
+        # prob_out: bsz, vocab_size
+        predict_ids = torch.argmax(prob_out, dim=-1, keepdim=True)
+        prob_out = torch.log(prob_out).detach().cpu().numpy()
+        predict_ids = predict_ids.detach().cpu().numpy()
+        # [ batch_size, 1 ]
+
+        output_dict = {}
+        new_input_ids = []
+        for i, (r, all_input_ids, next_token_id, next_token_logprob) in enumerate(
+            zip(batch.requests, batch.all_input_ids, predict_ids, prob_out)
+        ):
+            next_token_id = int(next_token_id)
+            next_token_logprob = next_token_logprob[next_token_id]
+            # all_input_ids_tensor = torch.tensor(all_input_ids, dtype=torch.long, device="cuda")
+            all_input_ids.append(next_token_id)
+            # all_input_ids_tensor = None
+            new_input_ids.append(next_token_id)
+            batch.all_input_ids[i] = all_input_ids
+            batch.input_lengths[i] += 1
+            batch.out_token_id_counts[i][next_token_id] += 1
+            metadata = {
+                "id": int(next_token_id),
+                "logprob": float(next_token_logprob),
+            }
+            output_dict[r["request_id"]] = (int(next_token_id), metadata)
+
+        batch.input_ids = torch.tensor(new_input_ids, dtype=torch.long).cuda()
+        batch.nopad_total_token_num += len(batch)
+        batch.nopad_max_len_in_batch += 1  # NOTE: we may repalce this
+        self.cache[batch.batch_id] = batch
+        return output_dict
+
+    @torch.no_grad()
+    def _prefill_batch(self, batch_id):
+        return self.forward(batch_id, is_prefill=True)
+
+    @torch.no_grad()
+    def _decode_batch(self, batch_id):
+        return self.forward(batch_id, is_prefill=False)
 
     # might want to create a sequence pool
     # add a single request/sequence/input text at a time and record its length

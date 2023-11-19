@@ -9,10 +9,11 @@ from colossalai.shardformer.policies.base_policy import ModulePolicyDescription,
 from colossalai.shardformer.policies.llama import LlamaForCausalLMPolicy
 
 from ..modeling._utils import init_to_get_rotary
-from ..modeling.llama import LlamaInferenceForwards, get_llama_vllm_rmsnorm_forward
+from ..modeling.llama import LlamaInferenceForwards
 
 try:
     from lightllm.models.llama.triton_kernel.rmsnorm import rmsnorm_forward as lightllm_rmsnorm_forward
+
     HAS_TRITON_RMSNORM = True
 except:
     print("you should install triton from https://github.com/openai/triton")
@@ -21,6 +22,7 @@ except:
 
 def get_triton_rmsnorm_forward():
     if HAS_TRITON_RMSNORM:
+
         def _triton_rmsnorm_forward(self: LlamaRMSNorm, hidden_states: torch.Tensor):
             return lightllm_rmsnorm_forward(hidden_states, self.weight.data, self.variance_epsilon)
 
@@ -36,7 +38,7 @@ class LlamaModelInferPolicy(LlamaForCausalLMPolicy):
     def module_policy(self):
         policy = super().module_policy()
 
-        if self.shard_config.inference_gptq:
+        if self.shard_config.extra_kwargs.get("inference_gptq", False):
             from colossalai.inference.quant.gptq.cai_gptq import ColCaiQuantLinear, RowCaiQuantLinear
 
             decoder_attribute_replacement = {
@@ -105,9 +107,6 @@ class LlamaModelInferPolicy(LlamaForCausalLMPolicy):
         infer_forward = None
         if HAS_TRITON_RMSNORM:
             infer_forward = get_triton_rmsnorm_forward()
-        else:
-            # NOTE: adding rms_norm from cuda kernels caused precision issue, fix @tiandiao123
-            infer_forward = get_llama_vllm_rmsnorm_forward()
 
         if infer_forward is not None:
             method_replacement = {"forward": partial(infer_forward)}
