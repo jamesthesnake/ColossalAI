@@ -7,10 +7,10 @@ from typing import Callable, Iterator, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.distributed_c10d import _get_default_group
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
-from torch.distributed.distributed_c10d import _get_default_group
 
 from colossalai.checkpoint_io import CheckpointIndexFile, CheckpointIO, GeneralCheckpointIO
 from colossalai.checkpoint_io.utils import (
@@ -25,6 +25,7 @@ from colossalai.cluster import DistCoordinator, ProcessGroupMesh
 from colossalai.interface import ModelWrapper, OptimizerWrapper
 from colossalai.shardformer import ShardConfig, ShardFormer
 from colossalai.utils import get_current_device
+from colossalai.utils.device import IS_NPU_AVAILABLE
 from colossalai.zero import GeminiDDP, GeminiOptimizer
 from colossalai.zero.gemini.memory_tracer import MemStats
 
@@ -36,6 +37,7 @@ SUPPORTED_PRECISION = ["fp16", "bf16"]
 PRECISION_STR_TO_DTYPE = {"fp16": torch.half, "bf16": torch.bfloat16}
 
 ZERO_AXIS, DP_AXIS, TP_AXIS = 0, 1, 2
+
 
 def get_param_info(optim: Optimizer):
     # Get a backup of necessary information of parameters for future use, which includes:
@@ -53,6 +55,8 @@ def get_param_info(optim: Optimizer):
         start_index += len(group["params"])
 
     return param_info
+
+
 class GeminiCheckpointIO(GeneralCheckpointIO):
     def __init__(self) -> None:
         super().__init__()
@@ -348,7 +352,7 @@ class GeminiPlugin(DPPluginBase):
         max_norm: float = 0.0,
         norm_type: float = 2.0,
         tp_size: int = 1,
-        extra_dp_size:int = 1,
+        extra_dp_size: int = 1,
         enable_all_optimization: bool = False,
         enable_fused_normalization: bool = False,
         enable_flash_attention: bool = False,
@@ -359,6 +363,8 @@ class GeminiPlugin(DPPluginBase):
     ) -> None:
         super().__init__()
         assert precision in SUPPORTED_PRECISION, f"precision {precision} is not supported"
+        if IS_NPU_AVAILABLE:
+            assert placement_policy == "static", "NPU only supports static placement policy"
         self.gemini_config = dict(
             chunk_config_dict=chunk_config_dict,
             chunk_init_device=(chunk_init_device or get_current_device()),
@@ -406,10 +412,14 @@ class GeminiPlugin(DPPluginBase):
         self.extra_dp_size = extra_dp_size
         world_size = dist.get_world_size()
         self.zero_size = world_size // (self.tp_size * self.extra_dp_size)
-        assert world_size == (self.tp_size * self.extra_dp_size) * self.zero_size, f"The global group size can't be evenly divided by the subgroup size."
+        assert (
+            world_size == (self.tp_size * self.extra_dp_size) * self.zero_size
+        ), f"The global group size can't be evenly divided by the subgroup size."
 
         self.pg_mesh = ProcessGroupMesh(self.zero_size, self.extra_dp_size, self.tp_size)
-        self.zero_group = self.pg_mesh.get_group_along_axis(ZERO_AXIS) if self.zero_size < world_size else _get_default_group()
+        self.zero_group = (
+            self.pg_mesh.get_group_along_axis(ZERO_AXIS) if self.zero_size < world_size else _get_default_group()
+        )
         self.extra_dp_group = self.pg_mesh.get_group_along_axis(DP_AXIS) if self.extra_dp_size > 1 else None
         self.tp_group = self.pg_mesh.get_group_along_axis(TP_AXIS) if self.tp_size > 1 else None
 
@@ -437,7 +447,7 @@ class GeminiPlugin(DPPluginBase):
         return True
 
     def supported_devices(self) -> List[str]:
-        return ["cuda"]
+        return ["cuda", "npu"]
 
     def configure(
         self,
@@ -463,7 +473,13 @@ class GeminiPlugin(DPPluginBase):
                 shardformer = ShardFormer(self.shard_config)
                 model, _ = shardformer.optimize(model)
 
-            model = GeminiDDP(model, **self.gemini_config, zero_group=self.zero_group, extra_dp_group=self.extra_dp_group, verbose=self.verbose)
+            model = GeminiDDP(
+                model,
+                **self.gemini_config,
+                zero_group=self.zero_group,
+                extra_dp_group=self.extra_dp_group,
+                verbose=self.verbose,
+            )
 
         if optimizer is not None and not isinstance(optimizer, OptimizerWrapper):
             optimizer = GeminiOptimizer(

@@ -5,7 +5,9 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+import colossalai.utils.device as device_utils
 from colossalai.cluster import DistCoordinator
+from colossalai.utils.device import get_current_device
 
 
 def divide(x: float, y: float) -> float:
@@ -20,7 +22,7 @@ def divide(x: float, y: float) -> float:
 def all_reduce_mean(x: float, world_size: int) -> float:
     if world_size == 1:
         return x
-    tensor = torch.tensor([x], device=torch.cuda.current_device())
+    tensor = torch.tensor([x], device=get_current_device())
     dist.all_reduce(tensor)
     tensor = tensor / world_size
     return tensor.item()
@@ -84,20 +86,24 @@ class PerformanceEvaluator:
         self.disable = self.ignore_steps > 0 and step < self.ignore_steps
         if self.disable:
             return
-        torch.cuda.synchronize()
+        device_utils.synchronize()
         self.timer.start()
 
     def on_step_end(self, input_ids: Tensor, **kwargs) -> None:
         if self.disable:
             return
-        torch.cuda.synchronize()
+        device_utils.synchronize()
         self.timer.end()
 
         batch_size, seq_len = input_ids.shape
 
         self.num_samples += batch_size
-        checkpoint_activations_factor = (3 + int(self.enable_grad_checkpoint))
-        self.flop_megatron += (24 * checkpoint_activations_factor * batch_size * seq_len * self.num_layers * (self.hidden_size**2)) * (1. + (seq_len / (6. * self.hidden_size)) + (self.vocab_size / (16. * self.num_layers * self.hidden_size)))
+        checkpoint_activations_factor = 3 + int(self.enable_grad_checkpoint)
+        self.flop_megatron += (
+            24 * checkpoint_activations_factor * batch_size * seq_len * self.num_layers * (self.hidden_size**2)
+        ) * (
+            1.0 + (seq_len / (6.0 * self.hidden_size)) + (self.vocab_size / (16.0 * self.num_layers * self.hidden_size))
+        )
         self.flop += batch_size * seq_len * self.model_numel * 2 * (3 + int(self.enable_grad_checkpoint))
 
     def on_fit_end(self) -> None:
